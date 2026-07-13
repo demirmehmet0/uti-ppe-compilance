@@ -6,9 +6,9 @@ setuptools.setup(
     author="DigiNova",
     author_email='info@diginova.com.tr',
     description="Package",
-    url='https://github.com/novavision-ai/package',
+    url='https://github.com/novavision-ai/uti-ppe-compliance',
     license='MIT',
-    install_requires=['sdk', 'opencv-python-headless'],
+    install_requires=['sdk'],
 
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -18,13 +18,9 @@ setuptools.setup(
 
     packages=[
         'novavision.package',
-        'novavision.package.classes',
-        'novavision.package.configs',
-        'novavision.package.dataloaders',
         'novavision.package.executors',
         'novavision.package.models',
         'novavision.package.utils',
-        'novavision.package.weights'
     ],
     package_dir={'novavision.package': 'src'},
     python_requires=">=3.6"
