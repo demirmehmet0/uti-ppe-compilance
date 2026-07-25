@@ -30,12 +30,17 @@ class PpeCompliance(Component):
     A single summary record is emitted per track WHEN THE TRACK LEAVES (absent for
     longer than the grace period) - for EVERY track, not only violations. The record
     carries the windowed union so the decision is made downstream (Expression):
-      - `requires` : {class: bool} unioned over the window
-      - `detected` : classes seen at least once in the window
-      - `missing`  : required classes never seen in the window
-      - `compliant`: True when nothing required is missing
-      - `duration` : seconds the track was observed
-    e.g. phone-use -> filter `requires.phone == True`; classic PPE -> `compliant == False`.
+      - `requires`     : {class: bool} unioned over the window
+      - `detected`     : classes seen at least once in the window
+      - `missing`      : required classes never seen in the window
+      - `compliant`    : True when nothing required is missing
+      - `presence`     : {class: ratio} - fraction of observed frames each class was seen
+      - `presenceRatio`: flat max presence over the required set (filter to drop stray
+                         detections that only clipped into another person's ROI briefly)
+      - `duration`     : seconds the track was observed
+      - `framesObserved`: number of frames the track was detected in the window
+    e.g. phone-use -> filter `detected In "cell phone"` AND `presenceRatio > 0.3`;
+         classic PPE -> `compliant == False`.
     """
 
     def __init__(self, request, bootstrap):
@@ -85,20 +90,40 @@ class PpeCompliance(Component):
     def _finalize(self, track, now):
         """Build the single summary record emitted when a track leaves. Unions over
         the sightings still retained (pruned at last presence, NOT re-pruned now, so
-        waiting out the grace period never empties the union)."""
+        waiting out the grace period never empties the union).
+
+        Also computes a per-class PRESENCE ratio = fraction of the track's observed
+        frames in which the class was seen. This separates a person genuinely holding
+        an item (high ratio) from one a stray detection only clipped into occasionally
+        (low ratio) - filter downstream on `presenceRatio` to drop false attributions.
+        """
         union = set()
+        counts = {}
         for _ts, seen in track["window"]:
             union.update(seen)
+            for cls in seen:
+                counts[cls] = counts.get(cls, 0) + 1
+        total = len(track["window"]) or 1
 
         required = self.required_override or sorted(track.get("required_keys", set()))
         missing = [cls for cls in required if cls not in union]
+
+        # per-class fraction of observed frames the class was present
+        presence = {cls: round(counts.get(cls, 0) / total, 3) for cls in required}
+        if presence:
+            presence_ratio = max(presence.values())          # required set (flat, no space-key)
+        else:
+            presence_ratio = round(max(counts.values(), default=0) / total, 3)  # else best seen
 
         event = dict(track.get("last_person") or {})  # carry bbox / track ids forward
         event["requires"] = {cls: (cls in union) for cls in required}
         event["detected"] = sorted(union)
         event["missing"] = sorted(missing)
         event["compliant"] = (not missing) if required else True
+        event["presence"] = presence
+        event["presenceRatio"] = presence_ratio
         event["duration"] = round(track.get("last_seen", now) - track.get("first_seen", now), 2)
+        event["framesObserved"] = total
         event["windowSeconds"] = self.window_seconds
         return event
 
