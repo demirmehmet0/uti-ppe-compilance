@@ -24,10 +24,12 @@ class InputPersons(Input):
 
 class OutputViolations(Output):
     """
-    PPE non-compliance events. Emitted at most ONCE per track lifetime (until the
-    track leaves the scene): a person whose required equipment could NOT be fully
-    observed across the trailing time window. Each event carries the track ids, the
-    aggregated `requires` (union over the window), a `missing` list and `compliant=False`.
+    Per-track summary events. Emitted at most ONCE per track lifetime, WHEN THE TRACK
+    LEAVES the scene (absent longer than the grace period), for EVERY track - not only
+    violations. Each event carries the track ids plus the windowed aggregation:
+    `requires` ({class: bool} union over the window), `detected`, `missing`,
+    `compliant` (bool) and `duration` (s). The flow decides downstream via Expression
+    (e.g. phone-use -> `requires.phone == True`; classic PPE -> `compliant == False`).
     """
     name: Literal["outputViolations"] = "outputViolations"
     value: List[Detection]

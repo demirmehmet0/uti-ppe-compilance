@@ -17,23 +17,25 @@ logger = LoggerManager()
 
 class PpeCompliance(Component):
     """
-    Per-track PPE compliance evaluator with single-record-per-track semantics.
+    Per-track PPE aggregator with one-record-per-track-at-track-loss semantics.
 
     Consumes the per-frame `outputPersons` from cap-ppe-detection (PpeOnDetections),
-    where every person carries a stable `trackerUUID`, a `requires` dict
+    where every person carries a stable `trackerUUID`/`trackerID`, a `requires` dict
     ({equipmentClass: bool} for THIS frame) and a per-frame `status` bool.
 
-    For each tracked person it keeps a trailing time window (default 10 s) of the
-    equipment classes seen at least once, and takes the UNION over that window:
-      - if a required class was detected even once within the window, the person is
-        credited with it (rule 1 & 2 - "1 kez bile tam ise tam", "yekune bakilir");
-      - a violation is raised only when, after a full window of observation, some
-        required class was NEVER seen in the window.
+    For each tracked person it keeps a trailing time window (default 10 s) and takes
+    the UNION of equipment classes seen at least once within it, so a momentarily
+    occluded item still counts ("1 kez bile gorulse var say").
 
-    A violation event is emitted at most ONCE per track lifetime (rule 3 - "track id
-    gidene kadar baska kayit acilmaz"): the `recorded` flag stays set until the track
-    disappears for longer than the grace period, at which point its state is dropped
-    so a genuinely new entry can be recorded again.
+    A single summary record is emitted per track WHEN THE TRACK LEAVES (absent for
+    longer than the grace period) - for EVERY track, not only violations. The record
+    carries the windowed union so the decision is made downstream (Expression):
+      - `requires` : {class: bool} unioned over the window
+      - `detected` : classes seen at least once in the window
+      - `missing`  : required classes never seen in the window
+      - `compliant`: True when nothing required is missing
+      - `duration` : seconds the track was observed
+    e.g. phone-use -> filter `requires.phone == True`; classic PPE -> `compliant == False`.
     """
 
     def __init__(self, request, bootstrap):
@@ -80,22 +82,32 @@ class PpeCompliance(Component):
             return list(self.required_override)
         return list(requires.keys())
 
-    def _window_union(self, track, cutoff):
-        """Union of every equipment class seen at least once within the window."""
+    def _finalize(self, track, now):
+        """Build the single summary record emitted when a track leaves. Unions over
+        the sightings still retained (pruned at last presence, NOT re-pruned now, so
+        waiting out the grace period never empties the union)."""
         union = set()
-        kept = []
-        for ts, seen in track["window"]:
-            if ts >= cutoff:
-                kept.append((ts, seen))
-                union.update(seen)
-        track["window"] = kept
-        return union
+        for _ts, seen in track["window"]:
+            union.update(seen)
+
+        required = self.required_override or sorted(track.get("required_keys", set()))
+        missing = [cls for cls in required if cls not in union]
+
+        event = dict(track.get("last_person") or {})  # carry bbox / track ids forward
+        event["requires"] = {cls: (cls in union) for cls in required}
+        event["detected"] = sorted(union)
+        event["missing"] = sorted(missing)
+        event["compliant"] = (not missing) if required else True
+        event["duration"] = round(track.get("last_seen", now) - track.get("first_seen", now), 2)
+        event["windowSeconds"] = self.window_seconds
+        return event
 
     def evaluate(self):
         now = time.time()
-        violations = []
         seen_keys = set()
 
+        # 1) Update per-track window state for everyone seen THIS frame.
+        #    Nothing is emitted while a track is still present.
         for person in self.input_persons:
             key = self._track_key(person)
             if key is None:
@@ -103,43 +115,37 @@ class PpeCompliance(Component):
             seen_keys.add(key)
 
             requires = person.get("requires") or {}
-            required = self._required_set(requires)
 
             track = self.tracks.get(key)
             if track is None:
-                track = {"window": [], "recorded": False, "first_seen": now}
+                track = {"window": [], "recorded": False,
+                         "first_seen": now, "required_keys": set()}
                 self.tracks[key] = track
 
             track["last_seen"] = now
+            track["last_person"] = person  # carried into the final record
+            track["required_keys"].update(self._required_set(requires))
             track["window"].append((now, self._seen_now(requires)))
-
+            # keep only sightings inside the trailing window (pruned while present)
             cutoff = now - self.window_seconds
-            union = self._window_union(track, cutoff)
+            track["window"] = [(ts, seen) for ts, seen in track["window"] if ts >= cutoff]
 
-            missing = [cls for cls in required if cls not in union]
-            warmed_up = (now - track["first_seen"]) >= self.window_seconds
-
-            if required and missing and warmed_up and not track["recorded"]:
-                event = dict(person)  # carry bbox / track ids / imgUID forward
-                event["requires"] = {cls: (cls in union) for cls in required}
-                event["status"] = False
-                event["compliant"] = False
-                event["missing"] = missing
-                event["windowSeconds"] = self.window_seconds
-                violations.append(event)
-                track["recorded"] = True
-
-        # Drop tracks absent longer than the grace period so a genuine re-entry
-        # (new tracker id) can be evaluated - and recorded - afresh.
+        # 2) A track absent longer than the grace period is 'gone': emit ONE
+        #    summary record for it (every track, not only violations), then drop it
+        #    so a genuine re-entry (new tracker id) is evaluated afresh.
+        records = []
         stale = [
             key for key, track in self.tracks.items()
             if key not in seen_keys and (now - track.get("last_seen", now)) > self.grace_period
         ]
         for key in stale:
+            track = self.tracks[key]
+            if not track.get("recorded"):
+                records.append(self._finalize(track, now))
             del self.tracks[key]
 
         self.bootstrap["tracks"] = self.tracks
-        return violations
+        return records
 
     def run(self):
         self.violations = self.evaluate()
