@@ -149,12 +149,12 @@ class PpeComplianceConfigs(Configs):
 
 class PpeComplianceInputs(Inputs):
     inputPersons: InputPersons
-    inputImage: Optional[InputImage] = None
+    inputImage: InputImage
 
 
 class PpeComplianceOutputs(Outputs):
     outputViolations: OutputViolations
-    outputImage: Optional[OutputImage] = None
+    outputImage: OutputImage
 
 
 class PpeComplianceResponse(Response):
