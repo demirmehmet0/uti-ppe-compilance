@@ -1,18 +1,14 @@
 
 from components.PpeCompliance.src.models.PackageModel import (
     PackageModel, PackageConfigs, ConfigExecutor, PpeCompliance,
-    PpeComplianceResponse, PpeComplianceOutputs, OutputViolations, OutputImage,
+    PpeComplianceResponse, PpeComplianceOutputs, OutputViolations,
 )
 from sdks.novavision.src.helper.package import PackageHelper
 
 
 def build_response(context):
     outputViolations = OutputViolations(value=context.violations)
-    outputImage = OutputImage(value=context.image)
-    ppeComplianceOutputs = PpeComplianceOutputs(
-        outputViolations=outputViolations,
-        outputImage=outputImage,
-    )
+    ppeComplianceOutputs = PpeComplianceOutputs(outputViolations=outputViolations)
     ppeComplianceResponse = PpeComplianceResponse(outputs=ppeComplianceOutputs)
     ppeComplianceExecutor = PpeCompliance(value=ppeComplianceResponse)
     executor = ConfigExecutor(value=ppeComplianceExecutor)
