@@ -106,8 +106,8 @@ class ConfigRequiredOverride(Config):
 
 class PpeComplianceConfigs(Configs):
     configWindowSeconds: ConfigWindowSeconds
-    configGracePeriod: Optional[ConfigGracePeriod] = None
-    configRequiredOverride: Optional[ConfigRequiredOverride] = None
+    configGracePeriod: ConfigGracePeriod
+    configRequiredOverride: ConfigRequiredOverride
 
 
 class PpeComplianceInputs(Inputs):
