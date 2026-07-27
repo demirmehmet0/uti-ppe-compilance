@@ -2,7 +2,7 @@
 from pydantic import Field
 from typing import List, Optional, Union, Literal
 from sdks.novavision.src.base.model import (
-    Inputs, Detection, Input, Package, Output, Config, Configs, Outputs, Response, Request,
+    Inputs, Detection, Image, Input, Package, Output, Config, Configs, Outputs, Response, Request,
 )
 
 
@@ -20,6 +20,43 @@ class InputPersons(Input):
 
     class Config:
         title = "PpePersons"
+
+
+class InputImage(Input):
+    """
+    OPTIONAL. The frame the persons were detected in. Connect it only if you want the
+    node to hand back the snapshot of the moment a track was LAST SEEN (see
+    `outputImage`). The aggregation itself does not need it.
+    """
+    name: Literal["inputImage"] = "inputImage"
+    value: Union[List[Image], Image]
+    type: str = "object"
+
+    class Config:
+        title = "Image"
+
+
+class OutputImage(Output):
+    """
+    The frame in which the emitted track was LAST SEEN - not the live frame.
+
+    Records are emitted once the track has already left the scene, so the frame that
+    is current at emission time no longer contains the person. While a track is alive
+    this node keeps the last frame it was seen in, and republishes that frame here
+    together with the record, so a downstream File Save / Notification attaches a
+    snapshot that actually shows the person.
+
+    On frames where nothing is emitted the input frame is passed through untouched.
+    If several tracks leave on the same frame, the snapshot belongs to the first
+    record in `outputViolations`. Requires `inputImage` to be connected; stays empty
+    otherwise.
+    """
+    name: Literal["outputImage"] = "outputImage"
+    value: Optional[Union[List[Image], Image]] = None
+    type: str = "object"
+
+    class Config:
+        title = "Snapshot"
 
 
 class OutputViolations(Output):
@@ -112,10 +149,12 @@ class PpeComplianceConfigs(Configs):
 
 class PpeComplianceInputs(Inputs):
     inputPersons: InputPersons
+    inputImage: Optional[InputImage] = None
 
 
 class PpeComplianceOutputs(Outputs):
     outputViolations: OutputViolations
+    outputImage: Optional[OutputImage] = None
 
 
 class PpeComplianceResponse(Response):

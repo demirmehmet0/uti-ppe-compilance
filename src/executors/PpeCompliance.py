@@ -1,11 +1,13 @@
 
 import os
 import sys
+import copy
 import time
 import json
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 
+from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.helper.executor import Executor
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.base.logger import LoggerManager
@@ -41,6 +43,14 @@ class PpeCompliance(Component):
       - `framesObserved`: number of frames the track was detected in the window
     e.g. phone-use -> filter `detected In "cell phone"` AND `presenceRatio > 0.3`;
          classic PPE -> `compliant == False`.
+
+    Because a record is only emitted AFTER the track has left, the frame that is
+    current at that moment no longer shows the person. When `inputImage` is connected
+    the node therefore buffers, per track, the decoded frame the track was last seen
+    in, and republishes it on `outputImage` alongside the record - so a downstream
+    File Save / Notification attaches a snapshot the person is actually visible in.
+    The frame has to be buffered decoded: the upstream image reference is overwritten
+    every frame, so resolving it later would yield the (empty) live frame.
     """
 
     def __init__(self, request, bootstrap):
@@ -48,12 +58,14 @@ class PpeCompliance(Component):
         self.request.model = PackageModel(**(self.request.data))
 
         self.input_persons = self.request.get_param("inputPersons") or []
+        self.input_image = self.request.get_param("inputImage")
         self.window_seconds = float(self.request.get_param("configWindowSeconds") or 10.0)
         self.grace_period = float(self.request.get_param("configGracePeriod") or 0.0)
         self.required_override = self._parse_override(self.request.get_param("configRequiredOverride"))
 
         # Per-track state, cached across frames (same pattern as uti-time-in-zone).
         self.tracks = self.bootstrap.get("tracks", {})
+        self.snapshot = None   # last-seen frame of the track emitted this run
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
@@ -127,9 +139,23 @@ class PpeCompliance(Component):
         event["windowSeconds"] = self.window_seconds
         return event
 
+    def _current_frame(self):
+        """Decode this frame once, so every track seen now can buffer it. Returns None
+        when no image is wired in - the aggregation works fine without one."""
+        if self.input_image is None:
+            return None
+        try:
+            return Image.get_frame(img=self.input_image, redis_db=self.redis_db)
+        except Exception as exc:
+            logger.warning(f"PpeCompliance - Could not read inputImage frame: {exc}")
+            return None
+
     def evaluate(self):
         now = time.time()
         seen_keys = set()
+
+        # Decoded once per frame and shared by every track seen now (read-only).
+        frame = self._current_frame() if self.input_persons else None
 
         # 1) Update per-track window state for everyone seen THIS frame.
         #    Nothing is emitted while a track is still present.
@@ -149,6 +175,8 @@ class PpeCompliance(Component):
 
             track["last_seen"] = now
             track["last_person"] = person  # carried into the final record
+            if frame is not None:
+                track["last_frame"] = frame  # snapshot of the moment last seen
             track["required_keys"].update(self._required_set(requires))
             track["window"].append((now, self._seen_now(requires)))
             # keep only sightings inside the trailing window (pruned while present)
@@ -167,13 +195,33 @@ class PpeCompliance(Component):
             track = self.tracks[key]
             if not track.get("recorded"):
                 records.append(self._finalize(track, now))
+                # snapshot belongs to the first record emitted on this frame
+                if self.snapshot is None:
+                    self.snapshot = track.get("last_frame")
             del self.tracks[key]
 
         self.bootstrap["tracks"] = self.tracks
         return records
 
+    def _publish_snapshot(self):
+        """Republish the buffered last-seen frame under this package so downstream
+        nodes resolve it. Nothing emitted this frame -> pass the input through."""
+        if self.snapshot is None:
+            return self.input_image
+        try:
+            return Image.set_frame(
+                img=copy.deepcopy(self.snapshot),   # set_frame stamps a new uID
+                package_uID=self.request.model.uID,
+                redis_db=self.redis_db,
+            )
+        except Exception as exc:
+            logger.warning(f"PpeCompliance - Could not publish snapshot: {exc}")
+            return self.input_image
+
     def run(self):
+        self.snapshot = None
         self.violations = self.evaluate()
+        self.image = self._publish_snapshot()
         packageModel = build_response(context=self)
         return packageModel
 
