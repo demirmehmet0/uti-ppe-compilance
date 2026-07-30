@@ -24,15 +24,12 @@ class InputPersons(Input):
 
 class OutputViolations(Output):
     """
-    Per-track summary events. Emitted exactly ONCE per track lifetime, for EVERY track
-    - not only violations. When the record appears depends on the evaluation mode:
-    "First Window" emits it as soon as the opening window closes (person still in
-    frame), "Full Track" emits it when the track is lost. Each event carries the track
-    ids plus the aggregation: `requires` ({class: bool} union over the aggregated
-    frames), `detected`, `missing`, `compliant` (bool), `presence`/`presenceRatio`,
-    `duration` (s), `framesObserved`, `evaluationMode` and `windowComplete`. The flow
-    decides downstream via Expression (e.g. phone-use -> `detected In "cell phone"`
-    with `presenceRatio > 0.3`; classic PPE -> `compliant == False`).
+    Per-track summary events. Emitted at most ONCE per track lifetime, WHEN THE TRACK
+    LEAVES the scene (absent longer than the grace period), for EVERY track - not only
+    violations. Each event carries the track ids plus the windowed aggregation:
+    `requires` ({class: bool} union over the window), `detected`, `missing`,
+    `compliant` (bool) and `duration` (s). The flow decides downstream via Expression
+    (e.g. phone-use -> `requires.phone == True`; classic PPE -> `compliant == False`).
     """
     name: Literal["outputViolations"] = "outputViolations"
     value: List[Detection]
@@ -44,16 +41,12 @@ class OutputViolations(Output):
 
 class ConfigWindowSeconds(Config):
     """
-    Length of the observation window (in seconds) used to decide compliance PER
+    Length of the trailing time window (in seconds) used to decide compliance PER
     TRACK. Across this window the system takes the UNION of every equipment class
     seen at least once: if a required class was detected even a single time within
-    the window, that person is credited with it, so a momentarily occluded item
-    does not cause a false violation.
-
-    ONLY USED BY THE "First Window" EVALUATION MODE, where it is the length of the
-    opening window measured from the moment the person is first tracked, and also
-    the moment the single record is emitted. In "Full Track" mode the whole track
-    lifetime is the window and this value is ignored.
+    the window, that person is credited with it. Compliance is only evaluated after
+    the track has been observed for at least this many seconds (warm-up), so a
+    momentarily occluded item does not cause a premature violation.
     """
     name: Literal["configWindowSeconds"] = "configWindowSeconds"
     value: float = Field(ge=0.1, le=3600.0, default=10.0)
@@ -64,7 +57,7 @@ class ConfigWindowSeconds(Config):
     class Config:
         title = "Window Seconds"
         json_schema_extra = {
-            "shortDescription": "Opening window (s) for First Window mode; ignored by Full Track."
+            "shortDescription": "Trailing window (s) over which equipment sightings are unioned per track."
         }
 
 
@@ -111,60 +104,7 @@ class ConfigRequiredOverride(Config):
         }
 
 
-class EvaluationFirstWindow(Config):
-    """
-    Judge each person over the OPENING window of their track: counting starts the
-    moment the person is first tracked and stops after Window Seconds, at which
-    point the single record for that track is emitted immediately - the person is
-    still in frame. Nothing further is emitted for that track, not even when it
-    later leaves. Use this when an alert has to arrive while the person can still
-    be reached (entrance PPE checks).
-    """
-    name: Literal["FirstWindow"] = "FirstWindow"
-    value: Literal["FirstWindow"] = "FirstWindow"
-    type: Literal["string"] = "string"
-    field: Literal["option"] = "option"
-
-    class Config:
-        title = "First Window"
-
-
-class EvaluationFullTrack(Config):
-    """
-    Judge each person over their ENTIRE track: every frame the person is detected
-    contributes, with no window pruning, and the single record is emitted when the
-    track is lost (absent longer than the Grace Period). Window Seconds is ignored.
-    Use this when the complete visit should be summarised (reporting, dwell-based
-    analysis) and a delayed record is acceptable.
-    """
-    name: Literal["FullTrack"] = "FullTrack"
-    value: Literal["FullTrack"] = "FullTrack"
-    type: Literal["string"] = "string"
-    field: Literal["option"] = "option"
-
-    class Config:
-        title = "Full Track"
-
-
-class ConfigEvaluationMode(Config):
-    """
-    Chooses WHICH frames of a track are aggregated and WHEN the single per-track
-    record is emitted. Either way exactly one record is produced per track.
-    """
-    name: Literal["configEvaluationMode"] = "configEvaluationMode"
-    value: Union[EvaluationFullTrack, EvaluationFirstWindow]
-    type: Literal["object"] = "object"
-    field: Literal["dropdownlist"] = "dropdownlist"
-
-    class Config:
-        title = "Evaluation Mode"
-        json_schema_extra = {
-            "shortDescription": "First Window (emit early, while present) or Full Track (emit at track loss)."
-        }
-
-
 class PpeComplianceConfigs(Configs):
-    configEvaluationMode: ConfigEvaluationMode
     configWindowSeconds: ConfigWindowSeconds
     configGracePeriod: ConfigGracePeriod
     configRequiredOverride: ConfigRequiredOverride
@@ -183,7 +123,7 @@ class PpeComplianceResponse(Response):
 
 
 class PpeComplianceRequest(Request):
-    inputs: Optional[PpeComplianceInputs]
+    inputs: PpeComplianceInputs
     configs: PpeComplianceConfigs
 
     class Config:

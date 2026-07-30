@@ -17,39 +17,28 @@ logger = LoggerManager()
 
 class PpeCompliance(Component):
     """
-    Per-track PPE aggregator with exactly-one-record-per-track semantics.
+    Per-track PPE aggregator with one-record-per-track-at-track-loss semantics.
 
     Consumes the per-frame `outputPersons` from cap-ppe-detection (PpeOnDetections),
     where every person carries a stable `trackerUUID`/`trackerID`, a `requires` dict
     ({equipmentClass: bool} for THIS frame) and a per-frame `status` bool.
 
-    Equipment sightings are accumulated per track as a UNION: a required class seen
-    even a single time counts as worn ("1 kez bile gorulse var say"), so a momentarily
-    occluded item does not raise a false violation. WHICH frames are accumulated and
-    WHEN the record is emitted is chosen by `configEvaluationMode`:
+    For each tracked person it keeps a trailing time window (default 10 s) and takes
+    the UNION of equipment classes seen at least once within it, so a momentarily
+    occluded item still counts ("1 kez bile gorulse var say").
 
-      - "FirstWindow": counts only the opening `configWindowSeconds` of the track and
-        emits the record the moment that window closes - the person is still in frame,
-        so the alert arrives while they can be reached. Nothing more is emitted for
-        that track, not even when it later leaves. A track that ends before its window
-        filled still yields its single record, flagged `windowComplete = False`.
-      - "FullTrack": counts every frame of the track with no pruning and emits the
-        record when the track is lost (absent longer than the grace period).
-        `configWindowSeconds` is unused in this mode.
-
-    The record carries the aggregation so the decision is made downstream (Expression):
-      - `requires`      : {class: bool} unioned over the aggregated frames
-      - `detected`      : classes seen at least once
-      - `missing`       : required classes never seen
-      - `compliant`     : True when nothing required is missing (also mirrored to
-                          `status`, overwriting the per-frame value PPE stamped)
-      - `presence`      : {class: ratio} - fraction of counted frames each class was seen
-      - `presenceRatio` : flat max presence over the required set (filter to drop stray
-                          detections that only clipped into another person's ROI briefly)
-      - `duration`      : seconds between the track's first and last sighting
-      - `framesObserved`: number of frames actually counted
-      - `evaluationMode`: which mode produced the record
-      - `windowComplete`: False only when FirstWindow was cut short by an early exit
+    A single summary record is emitted per track WHEN THE TRACK LEAVES (absent for
+    longer than the grace period) - for EVERY track, not only violations. The record
+    carries the windowed union so the decision is made downstream (Expression):
+      - `requires`     : {class: bool} unioned over the window
+      - `detected`     : classes seen at least once in the window
+      - `missing`      : required classes never seen in the window
+      - `compliant`    : True when nothing required is missing
+      - `presence`     : {class: ratio} - fraction of observed frames each class was seen
+      - `presenceRatio`: flat max presence over the required set (filter to drop stray
+                         detections that only clipped into another person's ROI briefly)
+      - `duration`     : seconds the track was observed
+      - `framesObserved`: number of frames the track was detected in the window
     e.g. phone-use -> filter `detected In "cell phone"` AND `presenceRatio > 0.3`;
          classic PPE -> `compliant == False`.
     """
@@ -59,10 +48,8 @@ class PpeCompliance(Component):
         self.request.model = PackageModel(**(self.request.data))
 
         self.input_persons = self.request.get_param("inputPersons") or []
-        self.evaluation_mode = self.request.get_param("configEvaluationMode") or "FullTrack"
-        self.first_window_mode = (self.evaluation_mode == "FirstWindow")
         self.window_seconds = float(self.request.get_param("configWindowSeconds") or 10.0)
-        self.grace_period = float(self.request.get_param("configGracePeriod") or 2.0)
+        self.grace_period = float(self.request.get_param("configGracePeriod") or 0.0)
         self.required_override = self._parse_override(self.request.get_param("configRequiredOverride"))
 
         # Per-track state, cached across frames (same pattern as uti-time-in-zone).
@@ -100,27 +87,28 @@ class PpeCompliance(Component):
             return list(self.required_override)
         return list(requires.keys())
 
-    def _finalize(self, track, now, window_complete=True):
-        """Build the single summary record for a track from its accumulated counters.
+    def _finalize(self, track, now):
+        """Build the single summary record emitted when a track leaves. Unions over
+        the sightings still retained (pruned at last presence, NOT re-pruned now, so
+        waiting out the grace period never empties the union).
 
-        Sightings are kept as {class: frames_seen} plus a counted-frame total rather
-        than a per-frame list, so a person standing in view for an hour costs the same
-        memory as one walking past.
-
-        `presence` is the per-class fraction of counted frames the class was seen in.
-        This separates a person genuinely wearing/holding an item (high ratio) from one
-        a stray detection only clipped into occasionally (low ratio) - filter downstream
-        on `presenceRatio` to drop false attributions.
+        Also computes a per-class PRESENCE ratio = fraction of the track's observed
+        frames in which the class was seen. This separates a person genuinely holding
+        an item (high ratio) from one a stray detection only clipped into occasionally
+        (low ratio) - filter downstream on `presenceRatio` to drop false attributions.
         """
-        counts = track["counts"]
-        total = track["total"] or 1
-        union = {cls for cls, seen in counts.items() if seen}
+        union = set()
+        counts = {}
+        for _ts, seen in track["window"]:
+            union.update(seen)
+            for cls in seen:
+                counts[cls] = counts.get(cls, 0) + 1
+        total = len(track["window"]) or 1
 
         required = self.required_override or sorted(track.get("required_keys", set()))
         missing = [cls for cls in required if cls not in union]
-        compliant = (not missing) if required else True
 
-        # per-class fraction of counted frames the class was present
+        # per-class fraction of observed frames the class was present
         presence = {cls: round(counts.get(cls, 0) / total, 3) for cls in required}
         if presence:
             presence_ratio = max(presence.values())          # required set (flat, no space-key)
@@ -131,96 +119,55 @@ class PpeCompliance(Component):
         event["requires"] = {cls: (cls in union) for cls in required}
         event["detected"] = sorted(union)
         event["missing"] = sorted(missing)
-        event["compliant"] = compliant
-        # PPE stamped a PER-FRAME `status` on the person; at track level that value is
-        # meaningless and contradicts `compliant`, so mirror the aggregated verdict.
-        event["status"] = compliant
+        event["compliant"] = (not missing) if required else True
         event["presence"] = presence
         event["presenceRatio"] = presence_ratio
-        # Weakest required item: `compliant` credits a class seen even once, which over a
-        # long FullTrack barely means anything. presenceMin says how consistently the
-        # WORST required item was actually worn, so a real PPE filter is
-        # `compliant == False OR presenceMin < 0.8` rather than `compliant` alone.
-        event["presenceMin"] = min(presence.values()) if presence else 0.0
         event["duration"] = round(track.get("last_seen", now) - track.get("first_seen", now), 2)
-        event["framesObserved"] = track["total"]
+        event["framesObserved"] = total
         event["windowSeconds"] = self.window_seconds
-        event["evaluationMode"] = self.evaluation_mode
-        event["windowComplete"] = window_complete
         return event
-
-    def _observe(self, key, person, now):
-        """Fold this frame's sighting into the person's track.
-
-        Returns the finalized record when FirstWindow's opening window closes on this
-        frame (the person is still in view), otherwise None.
-        """
-        track = self.tracks.get(key)
-        if track is None:
-            track = {"counts": {}, "total": 0, "recorded": False,
-                     "first_seen": now, "required_keys": set()}
-            self.tracks[key] = track
-
-        track["last_seen"] = now
-        track["last_person"] = person  # carried into the final record
-
-        # A track that already produced its record is kept alive (until it goes stale)
-        # purely so the same person is not evaluated a second time.
-        if track["recorded"]:
-            return None
-
-        requires = person.get("requires") or {}
-        track["required_keys"].update(self._required_set(requires))
-
-        elapsed = now - track["first_seen"]
-        if not self.first_window_mode or elapsed <= self.window_seconds:
-            track["total"] += 1
-            for cls in self._seen_now(requires):
-                track["counts"][cls] = track["counts"].get(cls, 0) + 1
-
-        if self.first_window_mode and elapsed >= self.window_seconds:
-            track["recorded"] = True
-            return self._finalize(track, now)
-        return None
-
-    def _collect_stale(self, now, seen_keys):
-        """Drop tracks absent longer than the grace period, recording those that have
-        not been recorded yet.
-
-        FullTrack builds its record here, over the whole track. FirstWindow normally
-        recorded while the person was present; if they left before their window filled,
-        the record is still emitted so no track goes unreported - flagged
-        `windowComplete=False` for downstream filtering. Either way the state is dropped
-        so a genuine re-entry (new tracker id) is evaluated afresh.
-        """
-        stale = [
-            key for key, track in self.tracks.items()
-            if key not in seen_keys and (now - track.get("last_seen", now)) > self.grace_period
-        ]
-        records = []
-        for key in stale:
-            track = self.tracks.pop(key)
-            if not track["recorded"]:
-                records.append(
-                    self._finalize(track, now, window_complete=not self.first_window_mode)
-                )
-        return records
 
     def evaluate(self):
         now = time.time()
         seen_keys = set()
-        records = []
 
+        # 1) Update per-track window state for everyone seen THIS frame.
+        #    Nothing is emitted while a track is still present.
         for person in self.input_persons:
             key = self._track_key(person)
             if key is None:
                 continue
             seen_keys.add(key)
-            record = self._observe(key, person, now)
-            if record is not None:
-                records.append(record)
 
-        records.extend(self._collect_stale(now, seen_keys))
+            requires = person.get("requires") or {}
+
+            track = self.tracks.get(key)
+            if track is None:
+                track = {"window": [], "recorded": False,
+                         "first_seen": now, "required_keys": set()}
+                self.tracks[key] = track
+
+            track["last_seen"] = now
+            track["last_person"] = person  # carried into the final record
+            track["required_keys"].update(self._required_set(requires))
+            track["window"].append((now, self._seen_now(requires)))
+            # keep only sightings inside the trailing window (pruned while present)
+            cutoff = now - self.window_seconds
+            track["window"] = [(ts, seen) for ts, seen in track["window"] if ts >= cutoff]
+
+        # 2) A track absent longer than the grace period is 'gone': emit ONE
+        #    summary record for it (every track, not only violations), then drop it
+        #    so a genuine re-entry (new tracker id) is evaluated afresh.
+        records = []
+        stale = [
+            key for key, track in self.tracks.items()
+            if key not in seen_keys and (now - track.get("last_seen", now)) > self.grace_period
+        ]
+        for key in stale:
+            track = self.tracks[key]
+            if not track.get("recorded"):
+                records.append(self._finalize(track, now))
+            del self.tracks[key]
 
         self.bootstrap["tracks"] = self.tracks
         return records
